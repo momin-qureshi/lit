@@ -20,6 +20,13 @@ class_name LitLightRegistry
 
 const TEXELS_PER_LIGHT := 5
 
+# A falloff ramp is a 1D curve, baked to RAMP_TEXELS samples across the light's radius.
+# The scene's ramps are stacked as rows of one lookup texture, since a shader global
+# can't hold an array of textures; a light points at its row through the flags field
+# (see _pack_point). Lights without a ramp cost nothing and the per-frame light-data
+# upload keeps its width. Must match LIT_RAMP_TEXELS in lit_receiver.gdshader.
+const RAMP_TEXELS := 64
+
 # Screen tile edge in pixels for the light-culling grid. Must match the shader's tile
 # math (it divides SCREEN_UV * viewport by lit_tile_size).
 const TILE_SIZE := 64
@@ -33,6 +40,14 @@ var _dummy: ImageTexture
 
 var _tile_header_tex: ImageTexture
 var _tile_index_tex: ImageTexture
+
+# Falloff-ramp LUT: gradient instance id -> row, plus the gradients we've subscribed
+# to so an inspector edit re-bakes. Rebuilt only when the light cache changes or a
+# watched gradient emits changed, so a steady scene re-uploads nothing.
+var _ramp_tex: ImageTexture
+var _ramp_rows: Dictionary = {}
+var _ramp_watched: Array = []
+var _ramp_dirty: bool = true
 
 # Reused scratch for packing: write floats straight into _pack_buf and upload once,
 # instead of per-texel Image.set_pixel calls. _pack_img is kept across frames and only
@@ -81,6 +96,8 @@ func refresh(tree: SceneTree, viewport: Viewport) -> void:
 	# AABB-culled against the visible world rect; directional lights are never
 	# positionally culled. A freed node marks the cache dirty so it rebuilds next frame.
 	var lights := _get_cached_lights(tree)
+	if _ramp_dirty:
+		_rebuild_ramp_lut(lights)
 	var visible: Array = []
 	for entry in lights:
 		var node: Node = entry[0]
@@ -158,8 +175,12 @@ func _pack_point(row: int, light: LitPointLight2D, canvas_xform: Transform2D, vp
 	var uv := screen_px / vp_size
 
 	# Integer fields stored as plain floats, decoded with int(round(...)) in the shader.
+	# flags bit 0 = shadow_enabled, bit 1 = subtractive, bits 2+ = falloff-ramp LUT row
+	# plus one (0 = no ramp). Folding the row into the spare high bits keeps the light
+	# record at TEXELS_PER_LIGHT and costs an unramped light nothing.
 	var subtractive := 1.0 if light.blend_mode == LitPointLight2D.BlendMode.SUBTRACT else 0.0
-	var flags := float(light.shadow_enabled) + 2.0 * subtractive
+	var ramp_slot := float(_ramp_row(light.falloff_ramp) + 1)
+	var flags := float(light.shadow_enabled) + 2.0 * subtractive + 4.0 * ramp_slot
 	const TYPE_POINT := 0.0
 
 	# Four floats per texel; o is the float offset of this light's first texel.
@@ -250,7 +271,8 @@ func _pack_spot(row: int, light: LitSpotLight2D, canvas_xform: Transform2D, vp_s
 		cos_inner = cos_outer + 0.0001
 
 	var subtractive := 1.0 if light.blend_mode == LitSpotLight2D.BlendMode.SUBTRACT else 0.0
-	var flags := float(light.shadow_enabled) + 2.0 * subtractive
+	var ramp_slot := float(_ramp_row(light.falloff_ramp) + 1)
+	var flags := float(light.shadow_enabled) + 2.0 * subtractive + 4.0 * ramp_slot
 	const TYPE_SPOT := 2.0
 
 	var o := row * TEXELS_PER_LIGHT * 4
@@ -379,6 +401,64 @@ func _publish_empty_tiles(vp_size: Vector2) -> void:
 	RenderingServer.global_shader_parameter_set("lit_tile_headers", _tile_header_tex)
 	RenderingServer.global_shader_parameter_set("lit_tile_indices", _tile_index_tex)
 
+## LUT row of a light's falloff ramp, or -1 for no ramp. A gradient assigned after the
+## LUT was baked (a runtime swap) misses the table: mark the LUT dirty so the next
+## frame picks it up, and fall back to the pow() curve for this one.
+func _ramp_row(ramp: Gradient) -> int:
+	if ramp == null:
+		return -1
+	var row: int = _ramp_rows.get(ramp.get_instance_id(), -1)
+	if row < 0:
+		_ramp_dirty = true
+	return row
+
+## Bake every distinct falloff_ramp in the light cache into the LUT: one row per
+## gradient, RAMP_TEXELS samples across [0, range]. Sharing one Gradient resource across
+## lights shares its row.
+##
+## This runs only when the light cache is rebuilt or a watched gradient changes, so a
+## steady scene pays nothing per frame. Gradient.sample is a binary search plus a lerp;
+## the whole bake is RAMP_TEXELS samples per distinct gradient, and it happens on edit,
+## not on draw.
+func _rebuild_ramp_lut(lights: Array) -> void:
+	_ramp_dirty = false
+	for g in _ramp_watched:
+		if is_instance_valid(g) and g.changed.is_connected(_on_ramp_changed):
+			g.changed.disconnect(_on_ramp_changed)
+	_ramp_watched.clear()
+	_ramp_rows.clear()
+
+	var grads: Array = []
+	for entry in lights:
+		var node: Node = entry[0]
+		# Directionals have no radial falloff, so no ramp.
+		if not is_instance_valid(node) or entry[1] == 1:
+			continue
+		var g: Gradient = node.get("falloff_ramp")
+		if g == null or _ramp_rows.has(g.get_instance_id()):
+			continue
+		_ramp_rows[g.get_instance_id()] = grads.size()
+		grads.append(g)
+
+	if grads.is_empty():
+		RenderingServer.global_shader_parameter_set("lit_ramp_lut", _get_dummy())
+		return
+
+	var img := Image.create(RAMP_TEXELS, grads.size(), false, Image.FORMAT_RGBAF)
+	for row in grads.size():
+		var g: Gradient = grads[row]
+		for s in RAMP_TEXELS:
+			img.set_pixel(s, row, g.sample(float(s) / float(RAMP_TEXELS - 1)))
+		if not g.changed.is_connected(_on_ramp_changed):
+			g.changed.connect(_on_ramp_changed)
+		_ramp_watched.append(g)
+
+	_ramp_tex = _make_or_update(_ramp_tex, img)
+	RenderingServer.global_shader_parameter_set("lit_ramp_lut", _ramp_tex)
+
+func _on_ramp_changed() -> void:
+	_ramp_dirty = true
+
 ## Reuse an ImageTexture when the image size is unchanged; reallocate on resize.
 ## ImageTexture.get_size() is Vector2 while Image.get_size() is Vector2i, so compare
 ## in a single type.
@@ -460,6 +540,9 @@ func _rebuild_light_cache(tree: SceneTree) -> void:
 		if kind >= 0:
 			_light_cache.append([node, kind])
 	_cache_dirty = false
+	# A light entering or leaving can add or drop a gradient, so the LUT re-bakes with
+	# the cache rather than tracking ramps separately.
+	_ramp_dirty = true
 
 ## 1x1 RGBAF texture published as the light data when there are no lights, so the
 ## sampler global is always valid.

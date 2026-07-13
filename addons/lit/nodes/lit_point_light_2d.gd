@@ -25,6 +25,10 @@ enum BlendMode { ADD, SUBTRACT }
 @export var range: float = 256.0
 ## Attenuation curve exponent.
 @export var falloff: float = 1.0
+## Hand-authored radial falloff: sampled over [center, range] instead of the
+## pow() curve when set. Alpha is intensity, rgb tints the light color, so
+## stepped bands and per-band color shifts live in the gradient, not in code.
+@export var falloff_ramp: Gradient
 ## Optional cookie/shape mask. Reserved, not wired into the transport yet.
 @export var texture: Texture2D
 @export var texture_scale: float = 1.0

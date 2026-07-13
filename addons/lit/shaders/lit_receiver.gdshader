@@ -29,6 +29,11 @@ global uniform sampler2D lit_tile_indices;
 global uniform ivec2     lit_tile_grid;                 // tiles across, tiles down
 global uniform int       lit_tile_size;                 // tile edge in pixels
 
+// Falloff ramps. Each ramp is 1D (LIT_RAMP_TEXELS samples across a light's radius); the
+// scene's ramps are stacked as rows of one texture so the shader can reach any of them.
+// Only fetched by lights that carry a ramp.
+global uniform sampler2D lit_ramp_lut;
+
 // Optional adaptive shadow march, driven by the lit/quality/* project settings via the
 // manager. When scaling is on, a fragment spends march steps in proportion to how far
 // it has to march, capped at lit_shadow_steps_max.
@@ -42,6 +47,10 @@ const int LIT_INDEX_TEX_WIDTH = 2048;
 // Compile-time ceiling on the shadow loop so it can be unrolled; lit_shadow_steps_max
 // is clamped to this on the CPU.
 const int LIT_MAX_SHADOW_STEPS = 256;
+
+// Samples per ramp, across [0, range]. A light names its row in the high bits of its
+// flags field. Must match RAMP_TEXELS in lit_light_registry.gd.
+const int LIT_RAMP_TEXELS = 64;
 
 // Values of lit_lighting_model; must match LightingModel in lit_manager.gd / lit_plugin.gd.
 const int   LIT_MODEL_PHONG = 0;
@@ -211,6 +220,8 @@ vec3 lit_shade(int i, vec3 albedo, vec3 N, vec3 spec_shin, float shininess,
 	int flags = int(round(t0.y));
 	bool shadow_enabled = (flags & 1) != 0;
 	bool subtractive = (flags & 2) != 0;
+	// Bits 2+ hold the light's ramp LUT row plus one; 0 means it uses the pow() curve.
+	int ramp_row = (flags >> 2) - 1;
 	float falloff = t0.w;
 
 	// Skip lights this receiver's mask doesn't share a bit with, before paying for
@@ -253,7 +264,27 @@ vec3 lit_shade(int i, vec3 albedo, vec3 N, vec3 spec_shin, float shininess,
 			return vec3(0.0);                // beyond range
 		}
 		Ldir = normalize(vec3(to_light_px, height_px));
-		atten = pow(clamp(1.0 - dist / range_px, 0.0, 1.0), falloff);
+		if (ramp_row >= 0) {
+			// Hand-authored radial ramp: alpha is intensity, rgb tints the light, so
+			// stepped bands and per-band color shifts live in the gradient. `falloff`
+			// warps the sample position so the knob still means something: >1 stretches
+			// the bright core outward, <1 compresses it.
+			//
+			// Interpolating between the two nearest samples keeps a ramp readable when
+			// its range covers more screen pixels than RAMP_TEXELS; a hard step in the
+			// gradient still lands within one texel (~range/63) of where it was authored.
+			float rt = pow(clamp(dist / range_px, 0.0, 1.0), 1.0 / max(falloff, 0.001))
+					* float(LIT_RAMP_TEXELS - 1);
+			int r0 = int(rt);
+			vec4 ramp = mix(
+				texelFetch(lit_ramp_lut, ivec2(r0, ramp_row), 0),
+				texelFetch(lit_ramp_lut, ivec2(min(r0 + 1, LIT_RAMP_TEXELS - 1), ramp_row), 0),
+				fract(rt));
+			light_color *= ramp.rgb;
+			atten = ramp.a;
+		} else {
+			atten = pow(clamp(1.0 - dist / range_px, 0.0, 1.0), falloff);
+		}
 
 		// A spot is a point light masked to a cone (texel 4): aim.xy is the
 		// screen-space direction it points. The fragment is lit if it falls inside

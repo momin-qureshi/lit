@@ -108,3 +108,9 @@ lit_tile_indices={
 "type": "sampler2D",
 "value": ""
 }
+lit_ramp_lut={
+"filter": "nearest",
+"repeat": "disable",
+"type": "sampler2D",
+"value": ""
+}

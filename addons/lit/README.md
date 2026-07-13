@@ -37,7 +37,8 @@ Prefer videos? Subscribe on YouTube:
    select existing `Sprite2D` / `TileMapLayer` / other 2D nodes and run
    **Project → Tools → Make Selected Nodes Lit**.
 4. **Add a light.** Drop a **`LitPointLight2D`** over your art and watch it light up. Tweak
-   color, energy, and range to taste.
+   color, energy, and range to taste. For a stylized look, give the light a **Falloff Ramp**
+   gradient and shape the fade by hand.
 5. **Want shadows?** On the light, tick **Shadow Enabled**. Then give the world something to
    block the light: add a `LightOccluder2D` to a sprite, or for tiles enable **SDF
    Collision** on your TileSet's occlusion layer. A `LitSprite2D` never shadows itself —
@@ -55,6 +56,10 @@ That's it — everything updates live in the editor as you build.
 - **Uncapped lights & Shadows.** No 15-light limit. Use as many as your scene needs.
 - **Three light types.** Point, Directional (a sun), and Spot (a cone).
 - **Soft or hard shadows.** One slider per light, from razor-sharp to feathery.
+- **Hand-authored falloff.** Give a point or spot light a **Falloff Ramp** gradient to
+  shape its fade: banded steps, a hard core, a rim that warms or cools with distance. The
+  ramp's alpha is intensity and its color tints the light. Leave it empty for the usual
+  smooth curve.
 - **No self-shadowing.** A sprite's own occluder casts behind it, not onto it, so you
   don't have to trace silhouette-perfect polygons. Per-sprite **Self Shadow** toggle.
 - **Normal maps & specular, free.** Reads them straight from your `CanvasTexture` — no wiring.
